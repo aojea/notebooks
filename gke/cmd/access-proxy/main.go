@@ -17,6 +17,7 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/kubeflow/notebooks/gke/internal/access"
 	"github.com/kubeflow/notebooks/gke/internal/connectionpolicy"
+	"github.com/kubeflow/notebooks/gke/internal/snapshot"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -33,8 +34,36 @@ func lifetimeEnvironment(name string) int64 {
 	return seconds
 }
 
+func floatEnvironment(name string, defaultVal float64) float64 {
+	value := os.Getenv(name)
+	if value == "" {
+		return defaultVal
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || parsed <= 0 {
+		log.Fatalf("%s must be a positive float", name)
+	}
+	return parsed
+}
+
+func intEnvironment(name string, defaultVal int) int {
+	value := os.Getenv(name)
+	if value == "" {
+		return defaultVal
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		log.Fatalf("%s must be a positive integer", name)
+	}
+	return parsed
+}
+
 func main() {
 	listen := flag.String("listen", ":8080", "HTTP listen address; TLS terminates at the GKE load balancer")
+	webhookListen := flag.String("webhook-listen", ":9443", "HTTPS listen address for Kubernetes Mutating Admission Webhooks")
+	webhookCert := flag.String("webhook-cert", "/tmp/k8s-webhook-server/serving-certs/tls.crt", "TLS certificate file for admission webhooks")
+	webhookKey := flag.String("webhook-key", "/tmp/k8s-webhook-server/serving-certs/tls.key", "TLS key file for admission webhooks")
+	snapshotBucket := flag.String("snapshot-bucket", os.Getenv("SNAPSHOT_GCS_BUCKET"), "GCS bucket for GKE PodSnapshots")
 	audience := flag.String("iap-audience", os.Getenv("IAP_AUDIENCE"), "Exact IAP signed assertion audience")
 	publicURL := flag.String("public-url", os.Getenv("PUBLIC_URL"), "Public HTTPS origin without a path")
 	desktopURL := flag.String("desktop-url", os.Getenv("DESKTOP_URL"), "Optional separate HTTPS origin for token-authenticated desktop access")
@@ -43,6 +72,8 @@ func main() {
 	frontendURL := flag.String("frontend-url", os.Getenv("FRONTEND_URL"), "Internal frontend HTTP origin")
 	backendURL := flag.String("backend-url", os.Getenv("BACKEND_URL"), "Internal backend HTTP origin")
 	tenants := flag.String("tenants", os.Getenv("TENANT_NAMESPACES"), "Comma-separated managed tenant namespaces")
+	kubeQPS := flag.Float64("kube-qps", floatEnvironment("KUBE_CLIENT_QPS", 100), "Kubernetes API client rate-limiter QPS (default 100)")
+	kubeBurst := flag.Int("kube-burst", intEnvironment("KUBE_CLIENT_BURST", 200), "Kubernetes API client rate-limiter burst (default 200)")
 	kubeconfig := flag.String("kubeconfig", "", "Optional kubeconfig for local testing; defaults to in-cluster credentials")
 	flag.Parse()
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -63,6 +94,8 @@ func main() {
 		log.Fatal(err)
 	}
 	config.Timeout = 10 * time.Second
+	config.QPS = float32(*kubeQPS)
+	config.Burst = *kubeBurst
 	managed := strings.Split(*tenants, ",")
 	for index := range managed {
 		managed[index] = strings.TrimSpace(managed[index])
@@ -71,6 +104,18 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	snapshotCtrl, err := snapshot.NewController(config, managed, *snapshotBucket, workspaces.InvalidateWorkspaceCache)
+	if err != nil {
+		log.Fatal(err)
+	}
+	go snapshotCtrl.Run(ctx)
+	webhookServer := snapshot.NewTLSServer(*webhookListen, *webhookCert, *webhookKey, snapshotCtrl.Handler())
+	go func() {
+		log.Printf("snapshot webhook listening on %s", *webhookListen)
+		if err := webhookServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("snapshot webhook listener exited: %v", err)
+		}
+	}()
 	parse := func(value string) *url.URL {
 		parsed, err := url.Parse(value)
 		if err != nil {
@@ -82,7 +127,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	server := &http.Server{Addr: *listen, Handler: proxy, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 << 10}
+	server := &http.Server{Addr: *listen, Handler: proxy, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 650 * time.Second, MaxHeaderBytes: 64 << 10}
 	var desktopServer *http.Server
 	if *desktopURL != "" {
 		if parse(*desktopURL).Host == parse(*publicURL).Host {
@@ -92,7 +137,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		desktopServer = &http.Server{Addr: ":8081", Handler: proxy.EnableConnections(connections), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+		desktopServer = &http.Server{Addr: ":8081", Handler: proxy.EnableConnections(connections), ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 650 * time.Second, MaxHeaderBytes: 16 << 10}
 		go connections.Cleanup(ctx)
 		go func() {
 			if err := desktopServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -105,6 +150,7 @@ func main() {
 		shutdown, stop := context.WithTimeout(context.Background(), 10*time.Second)
 		defer stop()
 		_ = server.Shutdown(shutdown)
+		_ = webhookServer.Shutdown(shutdown)
 		if desktopServer != nil {
 			_ = desktopServer.Shutdown(shutdown)
 		}
