@@ -561,14 +561,34 @@ kubectl --context="${CONTEXT}" get clustertrainingruntime
    ```
 
 3. **Register Custom `jupyterlab` WorkspaceKind & GPU/TPU ComputeClasses**:
-   Register the `jupyterlab` `WorkspaceKind` (which includes CPU, GPU, and TPU image/pod options and injects `REGISTRY` and `GCS_BUCKET` into workspace pods) and the GKE `ComputeClass` definitions (`tpu-v5-8-multi-host`, `tpu-v5-4-single-host`, `gpu-l4-spot`, `gpu-t4-spot`):
+   Register the `jupyterlab` `WorkspaceKind` (which includes CPU, GPU, and TPU image/pod options and injects `REGISTRY` and `GCS_BUCKET` into workspace pods) and the GKE `ComputeClass` definitions (`tpu-v5-8-multi-host`, `tpu-v5-4-single-host`, `gpu-l4-spot`, `gpu-t4-spot`).
+
+   The `WorkspaceKind` pins an exact image tag per variant rather than floating on `:latest-*`, so a Workspace restarts onto the image it was created with and a rebuild cannot swap the runtime underneath a running Workspace. `build_jupyterlab.sh` records the tags it produced in `gke/rendered/jupyterlab-image-tags.env`; source that file so you pin the images you actually built:
    ```bash
+   # Tags written by build_jupyterlab.sh. Without these, envsubst renders an empty
+   # tag and the WorkspaceKind cannot start a Pod.
+   source gke/rendered/jupyterlab-image-tags.env
+
    PROJECT_ID="${PROJECT}" \
    REGION="${REGION}" \
    REPO_NAME="${REPOSITORY}" \
    IMAGE_NAME="jupyterlab" \
    GCS_BUCKET="${GCS_BUCKET}" \
+   CPU_IMAGE_TAG="${CPU_IMAGE_TAG}" \
+   GPU_IMAGE_TAG="${GPU_IMAGE_TAG}" \
+   TPU_IMAGE_TAG="${TPU_IMAGE_TAG}" \
      envsubst < gke/jupyterlab/workspacekind.yaml | kubectl --context="${CONTEXT}" apply -f -
+
+   # Optionally register the resumable-only WorkspaceKind (CPU & GPU)
+   PROJECT_ID="${PROJECT}" \
+   REGION="${REGION}" \
+   REPO_NAME="${REPOSITORY}" \
+   IMAGE_NAME="jupyterlab" \
+   GCS_BUCKET="${GCS_BUCKET}" \
+   CPU_IMAGE_TAG="${CPU_IMAGE_TAG}" \
+   GPU_IMAGE_TAG="${GPU_IMAGE_TAG}" \
+   TPU_IMAGE_TAG="${TPU_IMAGE_TAG}" \
+     envsubst < gke/jupyterlab/workspacekind-resumable.yaml | kubectl --context="${CONTEXT}" apply -f -
 
    kubectl --context="${CONTEXT}" apply -f gke/manifests/compute-classes/
    ```
@@ -661,7 +681,7 @@ GKE Pod Snapshots enable **stateful Pause & Resume** for Kubeflow Workspaces: wh
 > [!IMPORTANT]
 > **Separate `SNAPSHOT_GCS_BUCKET` from `GCS_BUCKET`**: Container memory dumps may include in-memory tokens or environment state and have different lifecycle/retention requirements than shared datasets and training outputs (`gs://${GCS_BUCKET}`). Always configure a dedicated `SNAPSHOT_GCS_BUCKET` (default: `${TENANT_NAMESPACE}-snapshots-bucket`) separate from the workload data `GCS_BUCKET` (`${TENANT_NAMESPACE}-bucket`).
 
-This feature is implemented entirely in `gke-access-proxy` via two Kubernetes Mutating Admission Webhooks (`POST /mutate-workspace` and `POST /mutate-pod`), a custom Pod `readinessGate` (`podsnapshot.gke.kubeflow.org/active`), and a background snapshot reconciler—requiring **zero changes** to upstream Kubeflow `Workspace` / `WorkspaceKind` CRDs, `workspaces-controller`, Backend API, or React Frontend.
+This feature is implemented by the standalone `gke-workspace-snapshot-addon` Deployment (separate from `gke-access-proxy`, so a snapshot control-plane failure never affects notebook traffic) via two Kubernetes Mutating Admission Webhooks (`POST /mutate-workspace` and `POST /mutate-pod`), a custom Pod `readinessGate` (`podsnapshot.gke.kubeflow.org/active`), and a background snapshot reconciler—requiring **zero changes** to upstream Kubeflow `Workspace` / `WorkspaceKind` CRDs, `workspaces-controller`, Backend API, or React Frontend.
 
 ### Step 7.1: Configure `SNAPSHOT_GCS_BUCKET`, IAM (Workload Identity + GKE Service Agent), & Lifecycle Rule
 
@@ -735,7 +755,7 @@ GKE Pod Snapshots use a **cluster-scoped** `PodSnapshotStorageConfig` and a **na
 - **`PodSnapshotPolicy` (`ws-<workspace-name>-policy`)**: Namespace-scoped resource in `${TENANT_NAMESPACE}` targeting the Workspace's Pods via label selector `notebooks.kubeflow.org/workspace-name: <workspace-name>` with `triggerConfig: {type: manual, postCheckpoint: stop}` and `retentionConfig: {lastAccessTimeout: "7d"}`.
 
 **How Stale Snapshot Data Is Cleaned Up Automatically (4 Layers)**:
-1. **On Resume**: Immediately after a Pod restores from `PodSnapshot/<uuid>`, `gke-access-proxy` deletes the consumed `PodSnapshot` CR, which triggers `podsnapshot.gke.io/podsnapshot-finalizer` (`service-${PROJECT_NUMBER}@container-engine-robot.iam.gserviceaccount.com`) to delete the GCS folder (`checkpoint.img`, `pages.img`, `pages_meta.img`).
+1. **On Resume**: Immediately after a Pod restores from `PodSnapshot/<uuid>`, `gke-workspace-snapshot-addon` deletes the consumed `PodSnapshot` CR, which triggers `podsnapshot.gke.io/podsnapshot-finalizer` (`service-${PROJECT_NUMBER}@container-engine-robot.iam.gserviceaccount.com`) to delete the GCS folder (`checkpoint.img`, `pages.img`, `pages_meta.img`).
 2. **On Workspace Deletion While Paused**: `gke-access-proxy` attaches a Kubernetes `ownerReference` (`Workspace/<name>`) to every created `PodSnapshot` CR. If a user deletes a paused `Workspace` without ever resuming it, Kubernetes Garbage Collection immediately deletes the `PodSnapshot` CR and GKE deletes the GCS files.
 3. **On Abandoned Paused Workspaces (`retentionConfig.lastAccessTimeout: "7d"`)**: `PodSnapshotPolicy` sets `lastAccessTimeout: "7d"`, so GKE automatically expires and deletes any `PodSnapshot` not accessed within 7 days.
 4. **Hard GCS Billing Backstop (`Age: 14` days Lifecycle `Delete` Rule)**: Even if an entire GKE cluster is deleted without running `cleanup_standalone.sh`, GCS Object Lifecycle Management automatically purges any snapshot object older than 14 days in `gs://${SNAPSHOT_GCS_BUCKET}`.
@@ -780,7 +800,7 @@ When a Pod is created for a snapshot-enabled `Workspace`, the `POST /mutate-pod`
    - **What happens automatically**:
      - `POST /mutate-workspace` intercepts the update, keeps `spec.paused: false` temporarily, sets `podsnapshot.gke.kubeflow.org/checkpoint-state: "Checkpointing"`, and immediately flips the Pod's `podsnapshot.gke.kubeflow.org/active` readiness gate and `PodReady` condition to `False` (`READINESS GATES: 0/1`).
      - Flipping `PodReady` to `False` causes `workspaces-controller` to immediately transition `Workspace.status.state` out of `Running`, which disables the **Connect** button in the UI, hides the **Stop** action, blocks premature **Start** requests, removes the Pod from Service endpoints, and drains open WebSockets.
-     - After the 3-second socket settle window, `gke-access-proxy` creates `PodSnapshotManualTrigger/ws-<workspace-name>-trigger`, waits for GKE to finish uploading the `PodSnapshot` to `gs://${GCS_BUCKET}`, records `podsnapshot.gke.kubeflow.org/last-checkpoint-name: <snapshot-uuid>`, and patches `spec.paused: true` (`STATE: Paused`), scaling the Pod down to `0`.
+     - After the 3-second socket settle window, `gke-workspace-snapshot-addon` creates `PodSnapshotManualTrigger/ws-<workspace-name>-trigger`, waits for GKE to finish uploading the `PodSnapshot` to `gs://${GCS_BUCKET}`, records `podsnapshot.gke.kubeflow.org/last-checkpoint-name: <snapshot-uuid>`, and patches `spec.paused: true` (`STATE: Paused`), scaling the Pod down to `0`.
 
 2. **Monitor Checkpoint Progress**:
    ```bash
@@ -800,7 +820,7 @@ When a Pod is created for a snapshot-enabled `Workspace`, the `POST /mutate-pod`
      - `workspaces-controller` scales the `StatefulSet` back to `1`.
      - `POST /mutate-pod` injects `podsnapshot.gke.io/ps-name: <snapshot-uuid>` onto the new Pod.
      - Kubelet restores the container memory and live Jupyter kernels from GCS (`Normal GKEPodSnapshotting: Successfully restored the pod from PodSnapshot ...`).
-     - Once restored, `gke-access-proxy` sets `podsnapshot.gke.kubeflow.org/active = True` (`READINESS GATES: 1/1`), transitions the Workspace back to **Running**, clears the checkpoint annotations, and deletes the consumed `PodSnapshot` and `PodSnapshotManualTrigger` resources.
+     - Once restored, `gke-workspace-snapshot-addon` sets `podsnapshot.gke.kubeflow.org/active = True` (`READINESS GATES: 1/1`), transitions the Workspace back to **Running**, clears the checkpoint annotations, and deletes the consumed `PodSnapshot` and `PodSnapshotManualTrigger` resources.
 
 ---
 
